@@ -182,6 +182,7 @@ def build_gemm_a8w4_tdm_task(
     defer_c_wait=0,
     tdm_snop=0,
     k_waves=1,
+    single_row_store=0,
 ):
     """Build the grouped contiguous-M a8w4 TDM GEMM tile body (``gemm_task``).
 
@@ -365,6 +366,7 @@ def build_gemm_a8w4_tdm_task(
         rolled_drain,
         k_waves,
         m_align,
+        single_row_store,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -2609,7 +2611,28 @@ def build_gemm_a8w4_tdm_task(
                 else:
                     oc_store = oc
                     c_iter = fx.recast_iter(oc, arg_c)
-                if const_expr(a_preshuffled and stage1_quant_out and stage1_act):
+                if const_expr(single_row_store):
+                    # Embedded persistent callers may name one valid M row.
+                    # The tensor-store path transfers M16 slabs and is not
+                    # valid for that contract, so copy row zero explicitly.
+                    row_bytes = STORE_N if stage1_act else STORE_N * 2
+                    col_bytes = (
+                        out_col_off if stage1_act else out_col_off * 2
+                    )
+                    if tid < row_bytes // 4:
+                        word = lds_load_b32(
+                            fx.Int32(fx.ptrtoint(c_q_base_ptr)),
+                            fx.Int32(tid * 4),
+                        )[0]
+                        c_i32 = fx.recast_iter(fx.Int32, arg_c)
+                        fx.ptr_store(
+                            word,
+                            c_i32
+                            + fx.index_cast(
+                                T.index, col_bytes // 4 + tid
+                            ),
+                        )
+                elif const_expr(a_preshuffled and stage1_quant_out and stage1_act):
                     # M is allocated in complete M16 blocks. The final block's
                     # padding rows are unused, so transfer whole K32/M16 slabs.
                     c_off_rt = blk_m64 * fx.Int64(out_stride) + out_col_off * 16
